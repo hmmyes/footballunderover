@@ -1,40 +1,158 @@
+import streamlit as st
 import requests
 import json
-from datetime import datetime
 import time
+from datetime import datetime, timedelta
+import pandas as pd
 
-# API Key (senin verdiğin)
-API_KEY = 'e8c410058cafbc96a86a8ddaef5fc029'
-BASE_URL = 'https://v3.football.api-sports.io'
+# API Key - Kullanıcıdan alınmış
+API_KEY = "e8c410058cafbc96a86a8ddaef5fc029"
+BASE_URL = "https://api-football-v1.p.rapidapi.com/v3"
 
-# Cache for API calls (simple dict, expires in 5 minutes)
-cache = {}
-CACHE_EXPIRY = 300  # 5 minutes
+# Headers
+headers = {
+    "x-rapidapi-key": API_KEY,
+    "x-rapidapi-host": "api-football-v1.p.rapidapi.com"
+}
 
-def get_cached_data(endpoint, params=None):
-    now = time.time()
-    cache_key = f"{endpoint}_{json.dumps(params) if params else ''}"
-    if cache_key in cache:
-        timestamp, data = cache[cache_key]
-        if now - timestamp < CACHE_EXPIRY:
-            return data
-    return None
+# Cache süresi (API limitleri için, 5 dakika)
+CACHE_DURATION = 300  # saniye
 
-def set_cache(endpoint, params, data):
-    cache_key = f"{endpoint}_{json.dumps(params) if params else ''}"
-    cache[cache_key] = (time.time(), data)
+# Streamlit sidebar ile ayarlanabilir parametreler
+st.sidebar.header("Ayarlar")
+min_under_rate = st.sidebar.slider("Minimum Under 3.5 Oranı (%)", min_value=50, max_value=100, value=70, step=5)
+gol_dakika_baslangic = st.sidebar.number_input("Erken Gol Başlangıç Dakikası", min_value=1, max_value=90, value=10)
+gol_dakika_bitis = st.sidebar.number_input("Erken Gol Bitiş Dakikası", min_value=1, max_value=90, value=35)
+min_gol_sayisi = st.sidebar.number_input("Minimum Gol Sayısı (Erken Gol için)", min_value=1, max_value=5, value=1)
+max_gol_sayisi = st.sidebar.number_input("Maksimum Gol Sayısı (Erken Gol için)", min_value=1, max_value=5, value=2)
+ort_gol_limiti = st.sidebar.slider("Ortalama Gol Limiti (Under için)", min_value=1.0, max_value=4.0, value=2.5, step=0.1)
 
-def api_request(endpoint, params=None):
-    if params is None:
-        params = {}
-    # API-Football headers (apikey query param yerine header olarak da çalışır, ama query kullandım)
-    headers = {
-        'x-rapidapi-host': 'v3.football.api-sports.io',
-        'x-rapidapi-key': API_KEY
-    }
-    params['apikey'] = API_KEY  # Ekstra güvenlik
+guven_esikleri = {
+    "yildiz_3": st.sidebar.slider("3 Yıldız Güven Eşiği", min_value=50, max_value=100, value=80, step=5),
+    "yildiz_2": st.sidebar.slider("2 Yıldız Güven Eşiği", min_value=50, max_value=100, value=65, step=5),
+    "yildiz_1": st.sidebar.slider("1 Yıldız Güven Eşiği", min_value=50, max_value=100, value=50, step=5)
+}
+
+# Cache fonksiyonu
+@st.cache_data(ttl=CACHE_DURATION)
+def get_live_fixtures():
+    url = f"{BASE_URL}/fixtures?live=all"
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()['response']
+    else:
+        st.error(f"Hata: Canlı maçlar çekilemedi. Status: {response.status_code}")
+        return []
+
+@st.cache_data(ttl=CACHE_DURATION)
+def get_team_stats(team_id, last_matches=10):
+    url = f"{BASE_URL}/teams/statistics?team={team_id}&season=2024&league=39"  # Örnek league, değiştirilebilir
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        stats = response.json()['response']
+        # Son maçlar için under 3.5 hesapla (basitçe goals for + against < 4)
+        under_count = 0
+        total_matches = min(last_matches, len(stats.get('fixtures', [])))  # Fixtures yoksa hata önle
+        for match in stats.get('fixtures', [])[:last_matches]:
+            goals = match['goals']['home'] + match['goals']['away']
+            if goals < 4:
+                under_count += 1
+        return under_count / total_matches if total_matches > 0 else 0
+    return 0
+
+@st.cache_data(ttl=CACHE_DURATION)
+def get_h2h_stats(home_id, away_id, last_h2h=10):
+    url = f"{BASE_URL}/fixtures/headtohead?h2h={home_id}-{away_id}"
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        fixtures = response.json()['response']
+        under_count = 0
+        total_h2h = min(last_h2h, len(fixtures))
+        for fixture in fixtures[:last_h2h]:
+            goals = fixture['goals']['home'] + fixture['goals']['away']
+            if goals < 4:
+                under_count += 1
+        return under_count / total_h2h if total_h2h > 0 else 0
+    return 0
+
+@st.cache_data(ttl=CACHE_DURATION)
+def get_fixture_events(fixture_id):
+    url = f"{BASE_URL}/fixtures/events?fixture={fixture_id}"
+    response = requests.get(url, headers=headers)
+    if response.status_code == 200:
+        return response.json()['response']
+    return []
+
+def analyze_match(fixture, min_under_rate, gol_dakika_baslangic, gol_dakika_bitis, min_gol_sayisi, max_gol_sayisi, ort_gol_limiti):
+    home_team = fixture['teams']['home']['id']
+    away_team = fixture['teams']['away']['id']
+    fixture_id = fixture['fixture']['id']
+    current_minute = fixture['fixture']['status']['elapsed'] or 0
     
-    cached = get_cached_data(endpoint, params)
+    # Erken gol kontrolü
+    events = get_fixture_events(fixture_id)
+    gol_sayisi = 0
+    for event in events:
+        if event['type'] == 'Goal' and gol_dakika_baslangic <= event['time']['elapsed'] <= gol_dakika_bitis:
+            gol_sayisi += 1
+    
+    if not (min_gol_sayisi <= gol_sayisi <= max_gol_sayisi):
+        return None  # Erken gol kriteri uymuyor
+    
+    # İstatistikler
+    home_under_rate = get_team_stats(home_team) * 100
+    away_under_rate = get_team_stats(away_team) * 100
+    h2h_under_rate = get_h2h_stats(home_team, away_team) * 100
+    
+    avg_under_rate = (home_under_rate + away_under_rate + h2h_under_rate) / 3
+    
+    # Ortalama gol kontrolü (örnek olarak, takım stats'tan average goals al, ama basit tutalım)
+    if avg_under_rate < min_under_rate:
+        return None
+    
+    # Güven skoru: Basit ortalama
+    guven_skoru = avg_under_rate
+    
+    # Öneri
+    if guven_skoru >= guven_esikleri['yildiz_3']:
+        oneri = "⭐⭐⭐"
+    elif guven_skoru >= guven_esikleri['yildiz_2']:
+        oneri = "⭐⭐"
+    elif guven_skoru >= guven_esikleri['yildiz_1']:
+        oneri = "⭐"
+    else:
+        oneri = ""
+    
+    return {
+        "match": f"{fixture['teams']['home']['name']} vs {fixture['teams']['away']['name']}",
+        "current_score": f"{fixture['goals']['home']} - {fixture['goals']['away']}",
+        "minute": current_minute,
+        "under_rate": avg_under_rate,
+        "guven_skoru": guven_skoru,
+        "oneri": oneri
+    }
+
+# Ana uygulama
+st.title("Under 4.5 Öneri AI Agent")
+
+if st.button("Canlı Maçları Tara"):
+    with st.spinner("Maçlar taranıyor..."):
+        live_fixtures = get_live_fixtures()
+        results = []
+        for fixture in live_fixtures:
+            result = analyze_match(fixture, min_under_rate, gol_dakika_baslangic, gol_dakika_bitis, min_gol_sayisi, max_gol_sayisi, ort_gol_limiti)
+            if result:
+                results.append(result)
+        
+        if results:
+            df = pd.DataFrame(results)
+            st.table(df)
+        else:
+            st.info("Kriterlere uyan maç bulunamadı.")
+
+# Otomatik yenileme için (opsiyonel, Streamlit'te manuel button ile)
+st.markdown("---")
+st.caption("API-Football kullanılarak geliştirildi. Limitlere dikkat edin.")    cached = get_cached_data(endpoint, params)
     if cached:
         return cached
     
