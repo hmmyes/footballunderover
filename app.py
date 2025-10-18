@@ -1,40 +1,241 @@
-import streamlit as st
 import requests
-import pandas as pd
+import json
 from datetime import datetime
 import time
 
-# Sayfa yapılandırması
-st.set_page_config(
-    page_title="Under 4.5 Analiz",
-    page_icon="⚽",
-    layout="wide"
-)
+# API Key (senin verdiğin)
+API_KEY = 'e8c410058cafbc96a86a8ddaef5fc029'
+BASE_URL = 'https://v3.football.api-sports.io'
 
-# API Bilgileri
-API_KEY = "e8c410058cafbc96a86a8ddaef5fc029"
-API_HOST = "v3.football.api-sports.io"
-HEADERS = {
-    'x-rapidapi-host': API_HOST,
-    'x-rapidapi-key': API_KEY
+# Cache for API calls (simple dict, expires in 5 minutes)
+cache = {}
+CACHE_EXPIRY = 300  # 5 minutes
+
+def get_cached_data(endpoint, params=None):
+    now = time.time()
+    cache_key = f"{endpoint}_{json.dumps(params) if params else ''}"
+    if cache_key in cache:
+        timestamp, data = cache[cache_key]
+        if now - timestamp < CACHE_EXPIRY:
+            return data
+    return None
+
+def set_cache(endpoint, params, data):
+    cache_key = f"{endpoint}_{json.dumps(params) if params else ''}"
+    cache[cache_key] = (time.time(), data)
+
+def api_request(endpoint, params=None):
+    if params is None:
+        params = {}
+    # API-Football headers (apikey query param yerine header olarak da çalışır, ama query kullandım)
+    headers = {
+        'x-rapidapi-host': 'v3.football.api-sports.io',
+        'x-rapidapi-key': API_KEY
+    }
+    params['apikey'] = API_KEY  # Ekstra güvenlik
+    
+    cached = get_cached_data(endpoint, params)
+    if cached:
+        return cached
+    
+    url = f"{BASE_URL}/{endpoint}"
+    try:
+        response = requests.get(url, params=params, headers=headers)
+        if response.status_code == 200:
+            data = response.json()
+            set_cache(endpoint, params, data)
+            return data
+        else:
+            print(f"API Hata: {response.status_code} - {response.text}")
+            return None
+    except Exception as e:
+        print(f"Bağlantı Hatası: {e}")
+        return None
+
+# İsteğe Göre Ayarlanabilir CONFIG (Burayı değiştir!)
+CONFIG = {
+    'min_minute': 10,        # Erken gol min dakika
+    'max_minute': 35,        # Erken gol max dakika
+    'min_early_goals': 1,    # Min gol sayısı erken aşamada
+    'max_early_goals': 2,    # Max gol sayısı erken aşamada
+    'min_under_rate': 70,    # Under 3.5 min oranı (%) - BURAYI DEĞİŞTİR
+    'confidence_thresholds': {
+        '3_stars': 80,
+        '2_stars': 65,
+        '1_star': 50
+    },
+    'avg_goals_limit': 2.5   # Takım başına avg gol limiti
 }
 
-# CSS Stilleri
-st.markdown("""
-<style>
-    .main {
-        background: linear-gradient(135deg, #1e3c72 0%, #2a5298 100%);
+def get_live_matches():
+    """Canlı maçları çek"""
+    data = api_request('fixtures', {'live': 'all'})
+    if data and data['response']:
+        return data['response']
+    return []
+
+def get_match_statistics(league_id, season, team_id, last_n=10):
+    """Takımın son N maç istatistikleri"""
+    params = {
+        'team': team_id,
+        'last': last_n,
+        'season': season
     }
-    .stMetric {
-        background-color: #ffffff;
-        padding: 15px;
-        border-radius: 10px;
-        box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+    data = api_request('fixtures', params)
+    if data and data['response']:
+        matches = data['response'][-last_n:]  # Son N
+        valid_matches = [m for m in matches if m['goals']['home'] is not None and m['goals']['away'] is not None]
+        if not valid_matches:
+            return {'under_rate': 0, 'avg_goals': 0, 'total_matches': 0}
+        total_goals = sum(m['goals']['home'] + m['goals']['away'] for m in valid_matches)
+        under_3_5 = sum(1 for m in valid_matches if (m['goals']['home'] + m['goals']['away']) < 3.5)
+        under_rate = (under_3_5 / len(valid_matches)) * 100
+        avg_goals = total_goals / len(valid_matches)
+        return {
+            'under_rate': under_rate,
+            'avg_goals': avg_goals,
+            'total_matches': len(valid_matches)
+        }
+    return {'under_rate': 0, 'avg_goals': 0, 'total_matches': 0}
+
+def get_h2h_statistics(team1_id, team2_id, season, last_n=10):
+    """H2H son N maç"""
+    params = {
+        'team1': team1_id,
+        'team2': team2_id,
+        'last': last_n
     }
-    div[data-testid="stMetricValue"] {
-        font-size: 28px;
-        font-weight: bold;
+    data = api_request('fixtures/head2head', params)
+    if data and data['response']:
+        matches = data['response'][-last_n:]
+        valid_matches = [m for m in matches if m['goals']['home'] is not None and m['goals']['away'] is not None]
+        if not valid_matches:
+            return {'under_rate': 0, 'avg_goals': 0, 'total_matches': 0}
+        total_goals = sum(m['goals']['home'] + m['goals']['away'] for m in valid_matches)
+        under_3_5 = sum(1 for m in valid_matches if (m['goals']['home'] + m['goals']['away']) < 3.5)
+        under_rate = (under_3_5 / len(valid_matches)) * 100
+        avg_goals = total_goals / len(valid_matches)
+        return {
+            'under_rate': under_rate,
+            'avg_goals': avg_goals,
+            'total_matches': len(valid_matches)
+        }
+    return {'under_rate': 0, 'avg_goals': 0, 'total_matches': 0}
+
+def analyze_match(fixture):
+    """Tek maç analizi"""
+    goals = fixture.get('goals', {})
+    if goals.get('home') is None or goals.get('away') is None:
+        return None
+    
+    current_minute = fixture.get('fixture', {}).get('minute', 0) or fixture.get('minute', 0)  # Farklı response'larda değişebilir
+    total_goals = goals['home'] + goals['away']
+    
+    # Erken gol kontrolü (değiştirilebilir)
+    if not (CONFIG['min_minute'] <= current_minute <= CONFIG['max_minute'] and 
+            CONFIG['min_early_goals'] <= total_goals <= CONFIG['max_early_goals']):
+        return None
+    
+    home_team_id = fixture['teams']['home']['id']
+    away_team_id = fixture['teams']['away']['id']
+    league_id = fixture['league']['id']
+    season = fixture['league']['season']
+    
+    # İstatistikler
+    home_stats = get_match_statistics(league_id, season, home_team_id)
+    away_stats = get_match_statistics(league_id, season, away_team_id)
+    h2h_stats = get_h2h_statistics(home_team_id, away_team_id, season)
+    
+    # Güven skoru hesabı
+    under_rates = [home_stats['under_rate'], away_stats['under_rate'], h2h_stats['under_rate']]
+    avg_under = sum(under_rates) / 3 if under_rates else 0
+    
+    score = 0
+    if avg_under >= CONFIG['min_under_rate']:
+        score += 50
+    else:
+        score += (avg_under / CONFIG['min_under_rate']) * 50
+    
+    # Ek kontroller
+    if home_stats['avg_goals'] <= CONFIG['avg_goals_limit'] and away_stats['avg_goals'] <= CONFIG['avg_goals_limit']:
+        score += 20
+    if h2h_stats['avg_goals'] <= CONFIG['avg_goals_limit']:
+        score += 15
+    if h2h_stats['total_matches'] >= 3:  # H2H yeterli mi?
+        score += 10
+    if home_stats['total_matches'] >= 8 and away_stats['total_matches'] >= 8:  # Veri yeterli
+        score += 5
+    
+    score = min(score, 100)  # Max 100
+    
+    return {
+        'fixture': fixture,
+        'confidence': score,
+        'stats': {
+            'home_under': home_stats['under_rate'],
+            'away_under': away_stats['under_rate'],
+            'h2h_under': h2h_stats['under_rate']
+        }
     }
+
+def get_stars(confidence):
+    """Yıldız sistemi"""
+    if confidence >= CONFIG['confidence_thresholds']['3_stars']:
+        return '⭐⭐⭐'
+    elif confidence >= CONFIG['confidence_thresholds']['2_stars']:
+        return '⭐⭐'
+    elif confidence >= CONFIG['confidence_thresholds']['1_star']:
+        return '⭐'
+    return ''
+
+def get_recommendations():
+    """Ana fonksiyon: Önerileri getir"""
+    print("Canlı maçlar taranıyor...")
+    live_matches = get_live_matches()
+    recommendations = []
+    
+    for fixture in live_matches:
+        analysis = analyze_match(fixture)
+        if analysis:
+            recommendations.append(analysis)
+    
+    # Güven skoru'na göre sırala (yüksekten düşüğe)
+    recommendations.sort(key=lambda x: x['confidence'], reverse=True)
+    
+    return recommendations
+
+# Çalıştır
+if __name__ == "__main__":
+    print("=== Under 4.5 Öneri AI Agent ===")
+    print(f"Tarih: {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    
+    recommendations = get_recommendations()
+    
+    if not recommendations:
+        print("❌ Kriterlere uyan maç yok (veya canlı maç yok). Farklı saat dene!")
+    else:
+        print(f"\n✅ {len(recommendations)} maç önerisi bulundu (Under 4.5 için bas!):")
+        for i, rec in enumerate(recommendations, 1):
+            fixture = rec['fixture']
+            conf = rec['confidence']
+            stars = get_stars(conf)
+            home = fixture['teams']['home']['name']
+            away = fixture['teams']['away']['name']
+            score = f"{fixture['goals']['home']}-{fixture['goals']['away']}"
+            minute = fixture.get('minute', 0)
+            print(f"\n{i}. {home} vs {away} ({minute}' - {score})")
+            print(f"   Güven: {conf:.1f}/100 {stars}")
+            print(f"   Under Oranları: Ev {rec['stats']['home_under']:.1f}%, Deplasman {rec['stats']['away_under']:.1f}%, H2H {rec['stats']['h2h_under']:.1f}%")
+    
+    print("\n=== Mevcut Ayarlar (Değiştirmek için CONFIG'i edit et) ===")
+    for key, value in CONFIG.items():
+        if isinstance(value, dict):
+            print(f"{key}:")
+            for subkey, subval in value.items():
+                print(f"  {subkey}: {subval}")
+        else:
+            print(f"{key}: {value}")
+    print("Not: Under rate'i değiştirmek için 'min_under_rate' = yeni_değer yap. Gol dakikası için min/max_minute değiştir.")    }
 </style>
 """, unsafe_allow_html=True)
 
